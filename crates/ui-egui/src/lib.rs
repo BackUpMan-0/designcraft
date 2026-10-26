@@ -17,6 +17,7 @@ pub mod dock;
 pub mod effects_dialog;
 pub mod i18n;
 pub mod icons;
+pub mod keys;
 pub mod menus;
 mod modal_drag;
 mod new_document;
@@ -28,11 +29,14 @@ mod prefs;
 pub mod render_worker;
 mod rtl;
 mod section_options;
+pub mod separations;
 mod shortcut_import;
+mod shortcuts_dialog;
 pub mod story_editor;
 pub mod taskbar;
 pub mod theme;
 pub mod toolbar;
+pub mod updates_ui;
 pub mod widgets;
 
 use std::collections::HashMap;
@@ -201,7 +205,7 @@ fn default_zone() -> f64 {
 pub struct PdfExportSettings {
     /// Preset (one of the five presets, or "Custom" after a manual edit).
     pub preset: String,
-    /// PDF standard (`none`, `x4`, `a2b`).
+    /// PDF standard (`none`, `x1a`, `x4`, `a2b`).
     pub standard: String,
     /// Compression › Compress images (JPEG).
     pub compress_images: bool,
@@ -307,11 +311,9 @@ pub struct UiState {
     pub pdf_export: PdfExportSettings,
     /// The Preview checkbox of Paragraph/Character Style Options, remembered between openings.
     pub style_preview: bool,
-    /// View › Separations Preview: a process plate (0–3) and/or an ink limit (total, 0–4).
+    /// View › Separations Preview: the plate shown and the ink limit; `None` is off.
     #[serde(skip)]
-    pub separation: Option<u8>,
-    #[serde(skip)]
-    pub ink_limit: Option<f32>,
+    pub separations: Option<separations::Separations>,
     /// View › Display Performance.
     pub display_quality: designcraft_render::DisplayQuality,
     /// Preferences › Interface › UI scaling (1 = 100%).
@@ -321,8 +323,14 @@ pub struct UiState {
     pub rich_black: bool,
     /// View › Overprint Preview.
     pub overprint_preview: bool,
-    /// Edit › Keyboard Shortcuts: command id → shortcut ("" = none), over the defaults.
-    pub shortcuts: std::collections::BTreeMap<String, String>,
+    /// Edit › Keyboard Shortcuts: the active shortcut set's changes to the default shortcuts, which
+    /// the keymap uses. Saved as `shortcuts` and `shortcutsMore` (see `prefs::saved_shortcuts`),
+    /// which earlier versions read.
+    #[serde(flatten, with = "prefs::saved_shortcuts")]
+    pub shortcuts: craft_keymap::Overrides,
+    /// The user's named shortcut sets and which one is active (see `shortcuts_dialog`).
+    #[serde(deserialize_with = "prefs::lenient_sets")]
+    pub shortcut_sets: craft_keymap::Profiles,
     pub control_bar: bool,
     pub tools_double_column: bool,
     /// The front tab of the default layout's Properties · Pages · Layers group. `dock_tab`,
@@ -483,13 +491,13 @@ impl Default for UiState {
             flattener: String::new(),
             pdf_export: PdfExportSettings::default(),
             style_preview: false,
-            separation: None,
-            ink_limit: None,
+            separations: None,
             display_quality: designcraft_render::DisplayQuality::High,
             ui_scale: 1.0,
             rich_black: true,
             overprint_preview: false,
             shortcuts: Default::default(),
+            shortcut_sets: Default::default(),
             control_bar: false,
             tools_double_column: false,
             dock_tab: "properties".into(),
@@ -611,6 +619,7 @@ impl CanvasCache {
             display_key: None,
             patcher: designcraft_render::Renderer::new(),
             patches: 0,
+            separations: separations::Preview::default(),
         }
     }
 }
@@ -642,6 +651,8 @@ pub struct CanvasCache {
     pub patcher: designcraft_render::Renderer,
     /// Partial repaints / full renders since start (perf readout).
     pub patches: u64,
+    /// View › Separations Preview: the visible spreads' plates.
+    pub separations: separations::Preview,
 }
 
 #[derive(Default, Clone, Copy, Debug, Serialize)]
@@ -791,8 +802,16 @@ pub struct DesignApp {
     pub(crate) pending_window_commands: Vec<egui::ViewportCommand>,
     /// The host installed a native menu bar (macOS): don't draw menus in the window.
     pub native_menu: bool,
-    /// Shortcuts the native menu handles (skip them in the egui shortcut handler).
-    pub native_shortcuts: std::collections::HashSet<String>,
+    /// The commands the native menu bar gives a key equivalent, with that shortcut: the egui
+    /// shortcut handler leaves that key to the bar and runs the command's other bindings itself.
+    pub native_shortcuts: std::collections::HashMap<String, String>,
+    /// Every command's shortcuts, with the user's changes (`ui.shortcuts`) applied.
+    pub keymap: craft_keymap::Keymap,
+    pub(crate) key_dispatcher: craft_keymap::egui::Dispatcher,
+    /// The open Keyboard Shortcuts dialog.
+    pub(crate) shortcut_dialog: Option<Box<shortcuts_dialog::Host>>,
+    /// Answers the user gave in an import review (item → command), for later imports.
+    pub(crate) shortcut_answers: std::collections::BTreeMap<String, craft_keymap::CommandRef>,
     last_time: f64,
     /// When recovery data was last written (seconds on the monotonic clock; see [`now_ms`]).
     pub last_recovery: f64,
@@ -836,6 +855,7 @@ pub struct DesignApp {
     pub cursors: cursors::Images,
     /// A panel's live preview (a slider being dragged), committed when it is let go.
     live_preview: LivePreview,
+    pub(crate) updates_rt: updates_ui::Runtime,
 }
 
 /// The preview a panel opened with `edit.preview`: it stays open while a panel holds it each frame.
@@ -916,6 +936,10 @@ impl DesignApp {
             pending_window_commands: vec![],
             native_menu: false,
             native_shortcuts: Default::default(),
+            keymap: keys::new_keymap(craft_keymap::Overrides::new()),
+            key_dispatcher: craft_keymap::egui::Dispatcher::new(),
+            shortcut_dialog: None,
+            shortcut_answers: Default::default(),
             last_time: now,
             last_recovery: now,
             egui_ctx: None,
@@ -935,6 +959,7 @@ impl DesignApp {
             quitting: None,
             cursors: cursors::Images::default(),
             live_preview: LivePreview::default(),
+            updates_rt: updates_ui::Runtime::default(),
         }
     }
 
@@ -1360,9 +1385,74 @@ impl DesignApp {
         }
     }
 
+    /// Applies `ui.shortcuts` to the keymap when they differ, e.g. after preferences were loaded,
+    /// and rebuilds it when the shortcut platform changed (the web build learns the browser's
+    /// operating system on the first frame). Outside the Keyboard Shortcuts dialog the active
+    /// shortcut set takes `ui.shortcuts` too: an earlier version may have changed them.
+    pub fn sync_keymap(&mut self) {
+        if self.shortcut_dialog.is_none() {
+            keys::store_in_set(&mut self.ui);
+        }
+        if self.keymap.platform() != keys::platform() {
+            self.keymap = keys::new_keymap(self.ui.shortcuts.clone());
+        } else if *self.keymap.overrides() != self.ui.shortcuts {
+            self.keymap.set_overrides(self.ui.shortcuts.clone());
+        }
+    }
+
+    /// Whether the Keyboard Shortcuts dialog is recording keys: a native menu bar pauses its key
+    /// equivalents meanwhile, so the keys reach the dialog.
+    pub fn shortcut_recording(&self) -> bool {
+        self.shortcut_dialog.as_ref().is_some_and(|d| d.recording())
+    }
+
     pub fn select_tool(&mut self, id: &str) {
         let _ = self.run("tool.select", json!({"tool": id}));
         self.ui.flyout = None;
+    }
+
+    /// First frame only: load the saved colour profiles and make the saved Color Settings active.
+    fn apply_saved_color_settings(&mut self) {
+        if self.color_applied {
+            return;
+        }
+        self.color_applied = true;
+        for path in self.ui.color_profiles.clone() {
+            if let Err(e) = self.session.execute("color.loadProfile", &json!({"path": path})) {
+                log::warn!("Color Settings: {e}");
+                self.status_error("Color Settings", e);
+            }
+        }
+        if let Some(cs) = self.ui.color_settings.clone() {
+            let known = cs.with_known_profiles();
+            for (saved, used) in [(&cs.rgb, &known.rgb), (&cs.cmyk, &known.cmyk)] {
+                if saved != used {
+                    let e = format!("saved profile {saved} is not available; using {used}");
+                    log::warn!("Color Settings: {e}");
+                    self.status_error("Color Settings", e);
+                }
+            }
+            let _ = designcraft_color::cms::set_active(&known);
+        }
+    }
+
+    /// Install the UI fonts on the first frame, and again when the language or the system fonts change.
+    fn update_fonts(&mut self, ctx: &egui::Context) {
+        if !self.styled {
+            // The UI scale is a preference (applied above); egui's own Cmd+Plus/Minus/0 would rescale the
+            // whole window instead of the canvas, only to be reset next frame.
+            ctx.options_mut(|o| o.zoom_with_keyboard = false);
+            self.fonts_system = theme::install_fonts(ctx, &self.ui.language);
+            self.fonts_lang = self.ui.language.clone();
+            self.styled = true;
+            self.restyle = true;
+        } else {
+            if self.fonts_lang != self.ui.language || (!self.fonts_system && theme::system_fonts_ready()) {
+                self.fonts_system = theme::install_fonts(ctx, &self.ui.language);
+                self.fonts_lang = self.ui.language.clone();
+            }
+            self.fonts_ready = true;
+        }
     }
 
     /// Queue and deadline work, run once per app callback.
@@ -1384,6 +1474,7 @@ impl DesignApp {
     fn logic_tick(&mut self, ctx: &egui::Context) {
         self.update_screenshot_epoch(ctx);
         self.drain_control(ctx);
+        updates_ui::tick(self, ctx);
         if self.fonts_ready && !self.host_order_pending() {
             self.drain_inbox();
             self.open_os_documents();
@@ -1413,46 +1504,15 @@ impl DesignApp {
         if self.egui_ctx.is_none() {
             self.egui_ctx = Some(ctx.clone());
         }
+        keys::note_platform(ctx);
+        self.sync_keymap();
         self.window_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-        if !self.color_applied {
-            self.color_applied = true;
-            for path in self.ui.color_profiles.clone() {
-                if let Err(e) = self.session.execute("color.loadProfile", &json!({"path": path})) {
-                    log::warn!("Color Settings: {e}");
-                    self.status_error("Color Settings", e);
-                }
-            }
-            if let Some(cs) = self.ui.color_settings.clone() {
-                let known = cs.with_known_profiles();
-                for (saved, used) in [(&cs.rgb, &known.rgb), (&cs.cmyk, &known.cmyk)] {
-                    if saved != used {
-                        let e = format!("saved profile {saved} is not available; using {used}");
-                        log::warn!("Color Settings: {e}");
-                        self.status_error("Color Settings", e);
-                    }
-                }
-                let _ = designcraft_color::cms::set_active(&known);
-            }
-        }
+        self.apply_saved_color_settings();
         let scale = self.ui.ui_scale.clamp(0.5, 3.0);
         if (ctx.zoom_factor() - scale).abs() > 1e-3 {
             ctx.set_zoom_factor(scale);
         }
-        if !self.styled {
-            // The UI scale is a preference (applied above); egui's own Cmd+Plus/Minus/0 would rescale the
-            // whole window instead of the canvas, only to be reset next frame.
-            ctx.options_mut(|o| o.zoom_with_keyboard = false);
-            self.fonts_system = theme::install_fonts(ctx, &self.ui.language);
-            self.fonts_lang = self.ui.language.clone();
-            self.styled = true;
-            self.restyle = true;
-        } else {
-            if self.fonts_lang != self.ui.language || (!self.fonts_system && theme::system_fonts_ready()) {
-                self.fonts_system = theme::install_fonts(ctx, &self.ui.language);
-                self.fonts_lang = self.ui.language.clone();
-            }
-            self.fonts_ready = true;
-        }
+        self.update_fonts(ctx);
         if !self.fonts_system {
             // The font scan runs in the background: look again shortly.
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
@@ -2149,6 +2209,7 @@ impl DesignApp {
         story_editor::show(self, &ctx);
         dialogs::show(self, &ctx);
         about::show(self, &ctx);
+        updates_ui::show(self, &ctx);
         menus::palette(self, &ctx);
         // The IME is observed once, here: after the canvas, the floating panels, the story editor,
         // dialogs and Quick Apply have all applied this pass's commands and focus changes.
